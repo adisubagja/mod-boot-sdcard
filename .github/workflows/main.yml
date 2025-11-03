@@ -30,7 +30,7 @@ jobs:
         PWD=$(pwd)
         sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc > /dev/null 2>&1
         sudo -E apt-get -qq update > /dev/null 2>&1
-        sudo -E apt-get -y install wget python3 > /dev/null 2>&1
+        sudo -E apt-get -y install wget python3 unzip file > /dev/null 2>&1
         sudo -E apt-get -qq autoremove --purge > /dev/null 2>&1
         sudo -E apt-get -qq clean > /dev/null 2>&1
         sudo pip3 install gdown > /dev/null 2>&1
@@ -40,78 +40,137 @@ jobs:
 
     - name: Download Firmware
       run: |
+        # Buat directory openwrt jika belum ada
+        sudo mkdir -p openwrt
+        cd openwrt
+        
         if [ $(echo ${{ github.event.inputs.fw_link }} | grep "drive.") ]; then
           if [ $(echo ${{ github.event.inputs.fw_link }} | awk -F "/" '{print $6}') ]; then
             link_gdrive=$(echo ${{ github.event.inputs.fw_link }} | awk -F "/" '{print $6}')
           else
             link_gdrive=$(echo ${{ github.event.inputs.fw_link }} | awk -F "/" '{print $4}' | awk -F "?id=" '{print $2}'|awk -F "&export" '{print $1}')
           fi
-          sudo gdown ${link_gdrive} -O openwrt/$(echo "${{ github.event.inputs.fw_link }}" | awk -F/ '{print $NF}') >/dev/null
+          sudo gdown ${link_gdrive} -O $(echo "${{ github.event.inputs.fw_link }}" | awk -F/ '{print $NF}') >/dev/null
         else
           if [ $(echo ${{ github.event.inputs.fw_link }} | grep "mediafire.com") ]; then
-            sudo mediafire-dl ${{ github.event.inputs.fw_link }} -o openwrt/$(echo "${{ github.event.inputs.fw_link }}" | awk -F/ '{print $NF}') >/dev/null
+            sudo mediafire-dl ${{ github.event.inputs.fw_link }} -o $(echo "${{ github.event.inputs.fw_link }}" | awk -F/ '{print $NF}') >/dev/null
           else
             if [ $(echo ${{ github.event.inputs.fw_link }} | grep "mega.nz") ]; then
               file_mega=$(sudo mega-get ${{ github.event.inputs.fw_link }} | awk -F: '{print $2}')
-              sudo mv ${file_mega} openwrt/$(echo "${{ github.event.inputs.fw_link }}" | awk -F/ '{print $NF}')
+              sudo mv ${file_mega} $(echo "${{ github.event.inputs.fw_link }}" | awk -F/ '{print $NF}')
             else
-              sudo wget --no-check-certificate ${{ github.event.inputs.fw_link }} -O openwrt/$(echo "${{ github.event.inputs.fw_link }}" | awk -F/ '{print $NF}') >/dev/null
+              # Direct download
+              filename=$(echo "${{ github.event.inputs.fw_link }}" | awk -F/ '{print $NF}')
+              sudo wget --no-check-certificate "${{ github.event.inputs.fw_link }}" -O "${filename}" >/dev/null
             fi
           fi
         fi
 
-    - name: Get extension
-      id: get_extension
-      run: |
-        filename=$(find ./openwrt -name "*.img.*")
-        extension=$(basename "$filename" | sed -E 's/.*\.(img\.(gz|xz))$/\1/')
-        no_extension=$(basename "$filename" | sed -E 's/\.(gz|xz)$//')
-        echo "file_type=$extension" >> $GITHUB_ENV
-        echo "file_name=$no_extension" >> $GITHUB_ENV
-        
-    - name: Extract firmware
+    - name: Extract and Process Firmware
       run: |
         sudo mkdir -p openwrt/boot
         sudo mv BootCardMaker/u-boot.bin openwrt/
         sudo mv files/mod-boot-sdcard.tar.gz openwrt/
         cd openwrt
-        if [ ${{ env.file_type }} = "img.gz" ]; then
-          sudo gunzip ${{ env.file_name }}.gz
-        else
-          sudo unxz ${{ env.file_name }}.xz
+        
+        echo "=== File yang didownload ==="
+        ls -la
+        
+        # Ekstrak semua file yang didownload
+        for file in ./*; do
+          if [[ "$file" == *.zip ]]; then
+            echo "Extracting ZIP: $file"
+            sudo unzip -o "$file"
+          elif [[ "$file" == *.gz ]]; then
+            echo "Extracting GZ: $file"  
+            sudo gunzip -f "$file"
+          elif [[ "$file" == *.xz ]]; then
+            echo "Extracting XZ: $file"
+            sudo unxz -f "$file"
+          fi
+        done
+        
+        echo "=== File setelah ekstrak ==="
+        ls -la
+        
+        # Cari file .img setelah extract
+        img_file=$(find . -name "*.img" | head -1)
+        if [ -z "$img_file" ]; then
+          echo "❌ No IMG file found after extraction"
+          echo "Available files:"
+          find . -type f
+          exit 1
         fi
-        device=$(sudo losetup -fP --show ${{ env.file_name }})
+        
+        echo "Found IMG file: $img_file"
+        
+        # Lanjut proses modifikasi
+        device=$(sudo losetup -fP --show "$img_file")
+        echo "Using loop device: $device"
+        
+        # Mount partition 1
         sudo mount ${device}p1 boot
+        
+        # Extract mod boot files
         sudo tar -xzvf mod-boot-sdcard.tar.gz -C boot
+        
+        # Update extlinux.conf from uEnv.txt
         uenv=$(sudo cat boot/uEnv.txt | grep APPEND | awk -F "root=" '{print $2}')
         extlinux=$(sudo cat boot/extlinux/extlinux.conf | grep append | awk -F "root=" '{print $2}')
-        sudo sed -i "s/$extlinux/$uenv/g" boot/extlinux/extlinux.conf
+        sudo sed -i "s|$extlinux|$uenv|g" boot/extlinux/extlinux.conf
+        
         sleep 1
-        if [ ${{ github.event.inputs.bootloader }} = "b860h" ]; then
+        
+        # Set DTB based on bootloader selection
+        if [ "${{ github.event.inputs.bootloader }}" = "b860h" ]; then
           dtb="meson-gxl-s905x-b860h.dtb"
-        elif [ ${{ github.event.inputs.bootloader }} = "hg680p" ]; then
+        elif [ "${{ github.event.inputs.bootloader }}" = "hg680p" ]; then
           dtb="meson-gxl-s905x-p212.dtb"
         fi
-        boot=$(sudo cat boot/boot.ini | grep dtb | awk -F "/" '{print $4}' | cut -d'"' -f1)
-        sudo sed -i "s/$boot/$dtb/g" boot/boot.ini
-        sudo sed -i "s/$boot/$dtb/g" boot/extlinux/extlinux.conf
+        
+        # Update boot.ini and extlinux.conf with correct DTB
+        boot_dtb=$(sudo cat boot/boot.ini | grep dtb | awk -F "/" '{print $4}' | cut -d'"' -f1)
+        sudo sed -i "s|$boot_dtb|$dtb|g" boot/boot.ini
+        sudo sed -i "s|$boot_dtb|$dtb|g" boot/extlinux/extlinux.conf
+        
+        echo "Updated DTB to: $dtb"
+        
+        # Unmount partition
         sudo umount ${device}p1
         sleep 1
+        
+        # Write bootloader to image
         sudo dd if=u-boot.bin of=${device} bs=1 count=444 conv=fsync 2>/dev/null
         sudo dd if=u-boot.bin of=${device} bs=512 skip=1 seek=1 conv=fsync 2>/dev/null
+        
+        # Cleanup loop device
         sudo losetup -d ${device}
         sleep 1
-        if [ ${{ env.file_type }} = "img.gz" ]; then
-          sudo gzip ${{ env.file_name }}
-        else
-          sudo xz ${{ env.file_name }}
-        fi
+        
+        echo "=== File setelah modifikasi ==="
+        ls -la
 
-    - name: Find Firmware
+    - name: Find Modified Firmware
       run: |
-        FILE_PATH=$(find -name "*.img.*")
-        echo "FILE_PATH=$FILE_PATH" >> $GITHUB_ENV
-        echo -e "FILE_PATH path: $FILE_PATH"
+        cd openwrt
+        echo "=== Mencari file firmware yang sudah dimodifikasi ==="
+        ls -la
+        
+        # Cari file .img (yang sudah dimodifikasi)
+        IMG_FILE=$(find . -name "*.img" | head -1)
+        if [ -n "$IMG_FILE" ]; then
+          echo "Found modified IMG: $IMG_FILE"
+          # Beri nama baru untuk file hasil modifikasi
+          NEW_NAME="Modified_$(basename $IMG_FILE)"
+          sudo mv "$IMG_FILE" "$NEW_NAME"
+          echo "FILE_PATH=openwrt/$NEW_NAME" >> $GITHUB_ENV
+        else
+          # Jika tidak ada .img, cari file archive lainnya
+          FILE_PATH=$(find . -type f -name "*" ! -name ".*" | head -1)
+          echo "FILE_PATH=openwrt/$(basename $FILE_PATH)" >> $GITHUB_ENV
+        fi
+        
+        echo -e "FILE_PATH: $FILE_PATH"
 
     - name: Create Release
       uses: softprops/action-gh-release@v2
@@ -126,3 +185,6 @@ jobs:
               ${{ env.FILE_PATH }}
         body: |
               Mod SDCard
+              
+              Bootloader: ${{ github.event.inputs.bootloader }}
+              Original Firmware: ${{ github.event.inputs.fw_link }}
